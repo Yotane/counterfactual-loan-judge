@@ -144,17 +144,20 @@ def generate_shap_explanations(model: lgb.LGBMRegressor, df: pd.DataFrame,
 
 
 def prepare_econml_datasets(df: pd.DataFrame, feature_cols: list) -> dict:
-    # x drives heterogeneity, w drives confounding removal via dml residualization
-    # w includes propensity score alongside x features
-    X = df[feature_cols]
-    T = df[TREATMENT_COL].values
-    Y = df[TARGET_COL].values
-    W = df[feature_cols + ["propensity_score"]].copy()
+    # restrict to at-risk loans: ever seriously delinquent or ever treated
+    at_risk = (df["max_delinquency"] > 0) | (df["treated_before_peak"] > 0)
+    df_atrisk = df[at_risk].copy()
+    logger.info(f"at-risk sample: {len(df_atrisk):,} loans, "
+                f"treatment rate: {df_atrisk['treated_before_peak'].mean():.2%}")
+
+    X = df_atrisk[feature_cols]
+    T = df_atrisk["treated_before_peak"].values
+    Y = df_atrisk["max_delinquency"].values
+    W = df_atrisk[feature_cols].copy()
+    W["propensity_score"] = df_atrisk["propensity_score"].values
 
     logger.info(f"EconML ready: X={X.shape}, T={T.shape}, Y={Y.shape}, W={W.shape}")
-    logger.info(f"Treatment rate (treated_before_peak): {T.mean():.4f}")
     return {"X": X, "T": T, "Y": Y, "W": W, "feature_names": feature_cols}
-
 
 def sql_bi_export(df: pd.DataFrame, output_path: Path):
     # duckdb query for bi export: delinquency severity segmentation
