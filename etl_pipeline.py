@@ -1,12 +1,16 @@
 import os
 import sys
 from pathlib import Path
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, avg, count, max as spark_max
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import (
+    col, when, avg, count, max as spark_max, min as spark_min,
+    first, last, lag, lead
+)
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType, IntegerType
+)
 
 def main():
-    # initialize spark session with optimized config
     spark = SparkSession.builder \
         .appName("freddie_mac_sfll_etl") \
         .master("local[*]") \
@@ -20,7 +24,6 @@ def main():
         .getOrCreate()
 
     try:
-        # define origination schema (32 columns per user guide)
         orig_schema = StructType([
             StructField("credit_score", IntegerType(), True),
             StructField("first_payment_date", StringType(), True),
@@ -56,7 +59,6 @@ def main():
             StructField("mi_cancellation_indicator", StringType(), True)
         ])
 
-        # define performance schema (32 columns per user guide)
         perf_schema = StructType([
             StructField("loan_sequence_number", StringType(), True),
             StructField("monthly_reporting_period", StringType(), True),
@@ -92,7 +94,6 @@ def main():
             StructField("interest_bearing_upb", DoubleType(), True)
         ])
 
-        # load 2015 origination data
         data_dir = Path("data")
         quarters = ["2015Q1", "2015Q2", "2015Q3", "2015Q4"]
 
@@ -101,10 +102,13 @@ def main():
         for q in quarters:
             file_path = data_dir / f"historical_data_{q}.txt"
             if file_path.exists():
-                df = spark.read.option("delimiter", "|").option("nullValue", "").schema(orig_schema).csv(str(file_path))
+                df = spark.read \
+                    .option("delimiter", "|") \
+                    .option("nullValue", "") \
+                    .schema(orig_schema) \
+                    .csv(str(file_path))
                 orig_dfs.append(df)
-                cnt = df.count()
-                print(f"  {q}: {cnt:,} loans")
+                print(f"  {q}: {df.count():,} loans")
 
         if not orig_dfs:
             raise FileNotFoundError("No origination files found")
@@ -113,16 +117,16 @@ def main():
         for df in orig_dfs[1:]:
             orig_df = orig_df.unionByName(df)
 
-        total_loans = orig_df.count()
-        print(f"Total unique loans: {total_loans:,}")
-
-        # load 2015 performance data
         print("Loading performance data...")
         perf_dfs = []
         for q in quarters:
             file_path = data_dir / f"historical_data_time_{q}.txt"
             if file_path.exists():
-                df = spark.read.option("delimiter", "|").option("nullValue", "").schema(perf_schema).csv(str(file_path))
+                df = spark.read \
+                    .option("delimiter", "|") \
+                    .option("nullValue", "") \
+                    .schema(perf_schema) \
+                    .csv(str(file_path))
                 perf_dfs.append(df)
                 print(f"  {q}: loaded")
 
@@ -133,65 +137,98 @@ def main():
         for df in perf_dfs[1:]:
             perf_df = perf_df.unionByName(df)
 
-        total_perf = perf_df.count()
-        print(f"Total performance records: {total_perf:,}")
-        print(f"Avg months per loan: {total_perf / total_loans:.1f}")
-
-        # create treatment variable: only Y (current period modification) counts as onset
-
-        print("Creating treatment and outcome variables...")
-
-        def safe_delinquency_int(c):
+        # ra = reo acquisition, map to 99 so it sorts as worst state
+        def safe_delinq_int(c):
             return when(c == "RA", 99).otherwise(c.cast("int"))
 
-        perf_df = perf_df \
-            .withColumn("treatment_onset",
-                when(col("modification_flag") == "Y", 1).otherwise(0)) \
-            .withColumn("ever_defaulted",
-                when(col("zero_balance_code").isin(["02", "03", "09"]), 1)
-                .otherwise(0)) \
-            .withColumn("ever_seriously_delinquent",
-                when(safe_delinquency_int(col("current_loan_delinquency_status")) >= 2, 1)  # 60+ days
-                .otherwise(0)) \
-            .withColumn("ever_prepay",
-                when(col("zero_balance_code") == "01", 1)
-                .otherwise(0))
+        perf_df = perf_df.withColumn(
+            "delinq_int", safe_delinq_int(col("current_loan_delinquency_status"))
+        ).withColumn(
+            "period_int", col("monthly_reporting_period").cast("int")
+        ).withColumn(
+            "mod_onset", when(col("modification_flag") == "Y", 1).otherwise(0)
+        )
 
-        # aggregate performance to loan level across all months
-        
+        # per-loan window to find when modification and peak delinquency occurred
+        w_loan = Window.partitionBy("loan_sequence_number")
+
+        perf_df = perf_df \
+            .withColumn(
+                "first_mod_period",
+                spark_min(
+                    when(col("mod_onset") == 1, col("period_int"))
+                ).over(w_loan)
+            ) \
+            .withColumn(
+                "peak_delinq",
+                spark_max("delinq_int").over(w_loan)
+            ) \
+            .withColumn(
+                "peak_delinq_period",
+                spark_min(
+                    when(col("delinq_int") == col("peak_delinq"), col("period_int"))
+                ).over(w_loan)
+            )
+
+        # ever_treated: mod appeared at any point, kept for descriptive stats
+        # treated_before_peak: mod appeared before peak, the causal treatment variable
+        # loans modified after peak cannot have caused a reduction in peak severity
         perf_agg = perf_df \
             .groupBy("loan_sequence_number") \
             .agg(
-                spark_max("treatment_onset").alias("ever_treated"),
-                spark_max("ever_defaulted").alias("ever_defaulted"),
-                spark_max("ever_seriously_delinquent").alias("ever_seriously_delinquent"),
-                spark_max("ever_prepay").alias("ever_prepay"),
+                spark_max("mod_onset").alias("ever_treated"),
+                spark_max(
+                    when(
+                        (col("mod_onset") == 1) &
+                        (col("period_int") < col("peak_delinq_period")),
+                        1
+                    ).otherwise(0)
+                ).alias("treated_before_peak"),
+                spark_max(
+                    when(col("zero_balance_code").isin(["02", "03", "09"]), 1).otherwise(0)
+                ).alias("ever_defaulted"),
+                spark_max(
+                    when(safe_delinq_int(col("current_loan_delinquency_status")) >= 2, 1)
+                    .otherwise(0)
+                ).alias("ever_seriously_delinquent"),
+                spark_max(
+                    when(col("zero_balance_code") == "01", 1).otherwise(0)
+                ).alias("ever_prepay"),
                 count("*").alias("num_months_observed"),
                 avg("current_actual_upb").alias("avg_upb"),
-                spark_max(
-                    safe_delinquency_int(col("current_loan_delinquency_status"))
-                ).alias("max_delinquency")
+                spark_max("peak_delinq").alias("max_delinquency"),
+                # months_to_mod: lag between loan start and first mod, used as covariate
+                spark_min("first_mod_period").alias("first_mod_period_abs"),
+                spark_min("period_int").alias("first_period_abs")
+            ) \
+            .withColumn(
+                "months_to_mod",
+                when(
+                    col("first_mod_period_abs").isNotNull(),
+                    col("first_mod_period_abs") - col("first_period_abs")
+                ).otherwise(None)
             )
 
-        # join origination with aggregated performance
+        # join origination with aggregated performance, drop loans with < 6 months observed
         causal_df = orig_df \
             .join(perf_agg, on="loan_sequence_number", how="inner") \
             .filter(col("num_months_observed") >= 6)
 
-        # feature engineering: risk indicators
+        # risk feature engineering
         causal_df = causal_df \
             .withColumn("high_ltv", when(col("original_ltv") > 80, 1).otherwise(0)) \
             .withColumn("high_dti", when(col("original_dti") > 43, 1).otherwise(0)) \
             .withColumn("low_credit_score", when(col("credit_score") < 620, 1).otherwise(0)) \
-            .withColumn("investment_property", when(col("occupancy_status") == "I", 1).otherwise(0)) \
-            .withColumn("cash_out_refi", when(col("loan_purpose") == "C", 1).otherwise(0)) \
+            .withColumn("investment_property",
+                        when(col("occupancy_status") == "I", 1).otherwise(0)) \
+            .withColumn("cash_out_refi",
+                        when(col("loan_purpose") == "C", 1).otherwise(0)) \
             .withColumn("risk_score",
-                (col("high_ltv") * 0.25 + col("high_dti") * 0.25 +
-                 col("low_credit_score") * 0.3 + col("investment_property") * 0.1 +
-                 col("cash_out_refi") * 0.1))
+                col("high_ltv") * 0.25 + col("high_dti") * 0.25 +
+                col("low_credit_score") * 0.3 + col("investment_property") * 0.1 +
+                col("cash_out_refi") * 0.1
+            )
 
-        # define propensity features for downstream econml use
-        # string columns (occupancy_status, loan_purpose, property_state) need encoding before econml
         propensity_features = [
             "credit_score", "original_ltv", "original_dti", "original_upb",
             "original_interest_rate", "num_units", "original_loan_term",
@@ -199,23 +236,20 @@ def main():
             "occupancy_status", "loan_purpose", "property_state"
         ]
 
-        # repartition for efficient pandas conversion
         causal_df = causal_df.repartition("property_state")
 
-        # collect and save
         pdf = causal_df.toPandas()
         output_path = data_dir / "freddie_mac_causal_ready.parquet"
         pdf.to_parquet(output_path, index=False)
 
-        treatment_rate = pdf["ever_treated"].mean()
-        default_rate = pdf["ever_defaulted"].mean()
-        delinquency_rate = pdf["ever_seriously_delinquent"].mean()
-
-        print(f"ETL complete. Saved to {output_path}")
-        print(f"Treatment rate (ever modified): {treatment_rate:.2%}")
-        print(f"Default rate (02/03/09): {default_rate:.2%}")
-        print(f"Serious delinquency rate (60+ days): {delinquency_rate:.2%}")
-        print(f"Propensity features: {len(propensity_features)}")
+        print(f"\nETL complete. Saved to {output_path}")
+        print(f"Total loans: {len(pdf):,}")
+        print(f"ever_treated rate: {pdf['ever_treated'].mean():.2%}")
+        print(f"treated_before_peak rate: {pdf['treated_before_peak'].mean():.2%}")
+        print(f"  (= loans where modification preceded peak delinquency — causal treatment)")
+        at_risk = (pdf["max_delinquency"] > 0) | (pdf["ever_treated"] > 0)
+        print(f"At-risk loans: {at_risk.sum():,}")
+        print(f"treated_before_peak in at-risk: {pdf.loc[at_risk, 'treated_before_peak'].mean():.2%}")
 
     except Exception as e:
         print(f"Error during ETL: {e}")
