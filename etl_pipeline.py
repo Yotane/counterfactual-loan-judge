@@ -4,7 +4,7 @@ from pathlib import Path
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
     col, when, avg, count, max as spark_max, min as spark_min,
-    first, last, lag, lead
+    first, last, lag, lead, sum as spark_sum
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType, IntegerType
@@ -147,9 +147,10 @@ def main():
             "period_int", col("monthly_reporting_period").cast("int")
         ).withColumn(
             "mod_onset", when(col("modification_flag") == "Y", 1).otherwise(0)
+        ).withColumn(
+            "seriously_delinquent", when(col("delinq_int") >= 2, 1).otherwise(0)
         )
 
-        # per-loan window to find when modification and peak delinquency occurred
         w_loan = Window.partitionBy("loan_sequence_number")
 
         perf_df = perf_df \
@@ -170,9 +171,6 @@ def main():
                 ).over(w_loan)
             )
 
-        # ever_treated: mod appeared at any point, kept for descriptive stats
-        # treated_before_peak: mod appeared before peak, the causal treatment variable
-        # loans modified after peak cannot have caused a reduction in peak severity
         perf_agg = perf_df \
             .groupBy("loan_sequence_number") \
             .agg(
@@ -184,6 +182,7 @@ def main():
                         1
                     ).otherwise(0)
                 ).alias("treated_before_peak"),
+                # ever_defaulted: foreclosure proxy via third party sale, short sale, reo
                 spark_max(
                     when(col("zero_balance_code").isin(["02", "03", "09"]), 1).otherwise(0)
                 ).alias("ever_defaulted"),
@@ -197,7 +196,7 @@ def main():
                 count("*").alias("num_months_observed"),
                 avg("current_actual_upb").alias("avg_upb"),
                 spark_max("peak_delinq").alias("max_delinquency"),
-                # months_to_mod: lag between loan start and first mod, used as covariate
+                spark_sum("seriously_delinquent").alias("delinquency_duration"),
                 spark_min("first_mod_period").alias("first_mod_period_abs"),
                 spark_min("period_int").alias("first_period_abs")
             ) \
@@ -229,13 +228,6 @@ def main():
                 col("cash_out_refi") * 0.1
             )
 
-        propensity_features = [
-            "credit_score", "original_ltv", "original_dti", "original_upb",
-            "original_interest_rate", "num_units", "original_loan_term",
-            "high_ltv", "high_dti", "low_credit_score", "risk_score",
-            "occupancy_status", "loan_purpose", "property_state"
-        ]
-
         causal_df = causal_df.repartition("property_state")
 
         pdf = causal_df.toPandas()
@@ -245,11 +237,10 @@ def main():
         print(f"\nETL complete. Saved to {output_path}")
         print(f"Total loans: {len(pdf):,}")
         print(f"ever_treated rate: {pdf['ever_treated'].mean():.2%}")
-        print(f"treated_before_peak rate: {pdf['treated_before_peak'].mean():.2%}")
-        print(f"  (= loans where modification preceded peak delinquency — causal treatment)")
-        at_risk = (pdf["max_delinquency"] > 0) | (pdf["ever_treated"] > 0)
+        at_risk = (pdf["ever_seriously_delinquent"] == 1) | (pdf["ever_treated"] == 1)
         print(f"At-risk loans: {at_risk.sum():,}")
-        print(f"treated_before_peak in at-risk: {pdf.loc[at_risk, 'treated_before_peak'].mean():.2%}")
+        print(f"ever_treated in at-risk: {pdf.loc[at_risk, 'ever_treated'].mean():.2%}")
+        print(f"ever_defaulted in at-risk: {pdf.loc[at_risk, 'ever_defaulted'].mean():.2%}")
 
     except Exception as e:
         print(f"Error during ETL: {e}")
