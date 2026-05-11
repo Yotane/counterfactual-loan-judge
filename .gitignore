@@ -9,5 +9,9 @@ data/
 __pycache__/
 *.pyc
 
+# diagnostic checks
+check.py
+check2.py
+
 # environment variables
 .env
