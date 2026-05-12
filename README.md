@@ -1,6 +1,6 @@
 # Counterfactual Loan Modification Targeting
 
-**Mortgage servicers lose ~$60,000 on average when a loan ends in foreclosure** (the legal process where a lender repossesses and sells a home after the borrower stops making payments). **Loan modifications** (changes to the loan terms like lower interest rates, extended repayment periods, or temporary payment pauses) cost ~$300 to process and offer. But which distressed borrowers actually benefit from modification, and which would recover on their own?
+Mortgage servicers lose ~$60,000 on average when a loan ends in foreclosure (the legal process where a lender repossesses and sells a home after the borrower stops making payments). Loan modifications (changes to the loan terms like lower interest rates, extended repayment periods, or temporary payment pauses) cost ~$300 to process and offer. But which distressed borrowers actually benefit from modification, and which would recover on their own?
 
 This project answers that question using causal machine learning. We estimate how much a modification would change each borrower's foreclosure risk. The system then ranks borrowers by expected benefit and allocates outreach budgets to maximize foreclosures prevented per dollar spent.
 
