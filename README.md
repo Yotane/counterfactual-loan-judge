@@ -1,21 +1,45 @@
 # Counterfactual Loan Modification Targeting
 
-**Mortgage servicers lose $60,000 on average when a loan ends in foreclosure. Loan modifications cost $300 to process. But which distressed borrowers actually benefit from modification, and which would recover anyway?**
+**Mortgage servicers lose ~$60,000 on average when a loan ends in foreclosure** (the legal process where a lender repossesses and sells a home after the borrower stops making payments). **Loan modifications** (changes to the loan terms like lower interest rates, extended repayment periods, or temporary payment pauses) cost ~$300 to process and offer. But which distressed borrowers actually benefit from modification, and which would recover on their own?
 
-This project answers that question using causal machine learning. Instead of predicting who will default, we estimate how much a modification would change each borrower's foreclosure risk. The system then ranks borrowers by expected benefit and allocates outreach budgets to maximize foreclosures prevented per dollar spent.
+This project answers that question using causal machine learning. We estimate how much a modification would change each borrower's foreclosure risk. The system then ranks borrowers by expected benefit and allocates outreach budgets to maximize foreclosures prevented per dollar spent.
 
 Built on 1.47 million Freddie Mac mortgage loans from the 2015 vintage. Designed for Rakuten Bank credit operations and LINE Yahoo counterfactual ML roles.
+
+## Dataset Background
+
+### Freddie Mac Single-Family Loan-Level Dataset
+
+The data comes from the Federal Home Loan Mortgage Corporation (Freddie Mac), a government-sponsored enterprise that purchases mortgages from lenders and packages them into securities for investors. As part of their transparency initiative, Freddie Mac releases anonymized loan-level performance data for research purposes.
+
+**What the dataset contains:**
+- Origination details: credit score, loan-to-value ratio, debt-to-income ratio, loan amount, interest rate, property type, occupancy status
+- Monthly performance: payment status, delinquency level, principal balance, modification flags, final disposition codes
+- Geographic identifiers: state, ZIP code, metropolitan statistical area
+
+**Why this dataset is suitable for causal inference:**
+- Large scale: 1.47 million loans provides statistical power to detect heterogeneous effects
+- Long observation window: 2015 vintage loans have 6+ years of performance history to observe foreclosure outcomes
+- Rich covariates: detailed borrower and loan characteristics help control for confounding
+- Clear treatment definition: modification flags indicate when and if a loan received intervention
+
+**Limitations to acknowledge:**
+- Observational, not experimental: treatment assignment is not random, requiring careful causal methods
+- Selection bias: only loans purchased by Freddie Mac are included, which may differ from the broader mortgage market
+- Missing data: some fields like DTI are coded as 999 when not reported, requiring imputation or exclusion
 
 ## The Problem
 
 Servicers face a costly decision every day. A borrower is 60+ days behind on payments. Do we offer a loan modification?
 
-- If we modify a borrower who would have recovered anyway, we waste $300
-- If we skip a borrower who would have foreclosed without help, we lose $60,000
-- Historical data is confounded: modifications are only offered to the most distressed borrowers, so simple comparisons are biased
-- Live A/B testing is unethical and impractical at scale
+| Decision | If borrower would recover anyway | If borrower would foreclose without help |
+|----------|--------------------------------|-----------------------------------------|
+| **Offer modification** | Waste $300 on unnecessary outreach | Spend $300 to save $60,000, net gain $59,700 |
+| **Skip modification** | Save $300, no loss | Lose $60,000 to foreclosure costs |
 
-The core challenge is counterfactual: we need to estimate what would happen under two mutually exclusive scenarios for the same borrower.
+The challenge is we never observe both outcomes for the same borrower. Historical data is confounded: modifications are only offered to the most distressed borrowers, so simple comparisons make modifications look ineffective or even harmful. Live A/B testing is unethical and impractical at scale.
+
+The core question is counterfactual: for this specific borrower, how much would their foreclosure risk change if we offered a modification versus doing nothing?
 
 ## The Approach
 
@@ -25,7 +49,7 @@ We use doubly robust causal inference to estimate heterogeneous treatment effect
 2. **Filter by propensity score overlap** to remove loans where treatment assignment is deterministic
 3. **Train nuisance models** with LightGBM to predict both foreclosure risk and modification likelihood from observed features
 4. **Estimate CATE** with EconML's CausalForestDML, which residualizes confounding before building a forest of causal trees
-5. **Translate to dollars** using servicer economics: `utility = |CATE| × $60,000 - $300`
+5. **Translate to dollars** using servicer economics: `utility = |CATE| * $60,000 - $300`
 6. **Rank and target** borrowers by expected net benefit under budget constraints
 
 ## Key Results
@@ -146,7 +170,7 @@ This approach reduces bias from observed confounders while allowing effect heter
 CATE estimates are converted to dollar impact using servicer economics:
 
 ```
-utility = |CATE| × $60,000 - $300
+utility = |CATE| * $60,000 - $300
 ```
 
 Loans with positive utility are recommended for modification outreach. The system ranks all candidates by expected net benefit, enabling budget-constrained targeting.
@@ -266,13 +290,17 @@ curl "http://localhost:8000/budget_plan?budget_dollars=10000"
 
 ## Scope and Limitations
 
-- **At-risk sample**: Analysis restricted to borrowers with ≥60 days delinquency or prior modification. Results do not generalize to healthy loans
+- **At-risk sample**: Analysis restricted to borrowers with 60+ days delinquency or prior modification. Results do not generalize to healthy loans
 - **Binary foreclosure outcome**: The model predicts probability of foreclosure/charge-off/short sale, not timing or severity
+- **Static features**: Only origination characteristics are used. Time-varying borrower behavior is not incorporated
+- **Observational data**: Causal estimates rely on unconfoundedness given observed features. Unmeasured distress factors may bias results
 
 ## Future Roadmap
 
 - **Multi-outcome modeling**: Jointly estimate effects on foreclosure, prepayment, and recovery amount
-
+- **Dynamic features**: Incorporate payment history and delinquency trajectories as time-varying covariates
+- **Servicer-level heterogeneity**: Allow treatment effects to vary by servicer practices and regional policies
+- **Production monitoring**: Add drift detection and periodic retraining for deployed models
 
 ## License
 
@@ -280,6 +308,6 @@ This project is for educational purposes. Dataset sourced from [Freddie Mac](htt
 
 ## Author
 
-Matt Raymond Ayento  
-Nagoya University  
+Matt Raymond Ayento
+Nagoya University
 G30, 3rd year Automotive Engineering (Electrical, Electronics, Information Engineering)
