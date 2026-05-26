@@ -4,7 +4,7 @@ Mortgage servicers lose ~$60,000 on average when a loan ends in foreclosure (the
 
 This project answers that question using causal machine learning. We estimate how much a modification would change each borrower's foreclosure risk. The system then ranks borrowers by expected benefit and allocates outreach budgets to maximize foreclosures prevented per dollar spent.
 
-Built on 1.47 million Freddie Mac mortgage loans from the 2015 vintage. Designed for Rakuten Bank credit operations and LINE Yahoo counterfactual ML roles.
+Built on 1.47 million Freddie Mac mortgage loans from the 2015 vintage.
 
 ## Dataset Background
 
